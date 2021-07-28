@@ -54,7 +54,7 @@ public class MrSpeedyController {
 
     }
 
-    @PostMapping(path = {"/callback"}, name = "orders-sp-callback")
+    @PostMapping(path = {"/callback"}, name = "mrspeedy-callback")
     public ResponseEntity<HttpResponse> spCallback(HttpServletRequest request,
                                                   @Valid @RequestBody Object requestBody){
 
