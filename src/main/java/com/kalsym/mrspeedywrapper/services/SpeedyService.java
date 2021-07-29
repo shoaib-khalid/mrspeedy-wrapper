@@ -1,11 +1,10 @@
 package com.kalsym.mrspeedywrapper.services;
 
 import com.google.gson.Gson;
-import com.kalsym.mrspeedywrapper.models.Order;
 import com.kalsym.mrspeedywrapper.models.Person;
 import com.kalsym.mrspeedywrapper.models.Point;
+import com.kalsym.mrspeedywrapper.models.enums.DeliveryStatus;
 import com.kalsym.mrspeedywrapper.models.request.QuotationRequest;
-import com.kalsym.mrspeedywrapper.models.response.QuotationResponse;
 import com.kalsym.mrspeedywrapper.models.response.Response;
 import com.kalsym.mrspeedywrapper.repositories.DeliveryRepository;
 import com.kalsym.mrspeedywrapper.repositories.DropoffDetailsRepository;
@@ -32,6 +31,8 @@ import org.springframework.web.client.RestTemplate;
 
 import javax.servlet.http.HttpServletRequest;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 
 @Service
@@ -59,6 +60,13 @@ public class SpeedyService extends ParentService {
 
     @Value("${mrspeedy.key}")
     private String MR_SPEEDY_KEY;
+
+    @Value("${status.being_delivered}")
+    private String STATUS_BEING_DELIVERED;
+
+    @Value("${status.delivered_to_customer}")
+    private String STATUS_DELIVERED_TO_CUSTOMER;
+
 
     @Override
     public Delivery addQuotation(HttpServletRequest httpServletRequest, Delivery delivery) {
@@ -201,14 +209,14 @@ public class SpeedyService extends ParentService {
 
         delivery.setDpRefId(response.getOrder().getOrder_id());
 
-        delivery.setStatus(Status.BEING_DELIVERED_TO_CUSTOMER);
+        delivery.setStatus(Status.BEING_DELIVERED);
 
         trackingInfoRepository.save(trackingInfo);
         Delivery placedDeliveryOrder = deliveryRepository.save(delivery);
 
         try {
             MqttPublisher publisher = new MqttPublisher("192.168.0.201:30408","publisher");
-            StatusMessage statusMessage = new StatusMessage(Status.BEING_DELIVERED_TO_CUSTOMER);
+            StatusMessage statusMessage = new StatusMessage(Status.BEING_DELIVERED);
             JSONObject message = new JSONObject(statusMessage);
 
 
@@ -222,5 +230,47 @@ public class SpeedyService extends ParentService {
         }
 
         return placedDeliveryOrder;
+    }
+
+    public Delivery updateOnCallback(String dpRefId, String status){
+
+        String id = deliveryRepository.findByOrderId(dpRefId);
+
+        Optional<Delivery> optDelivery = deliveryRepository.findById(id);
+
+        Delivery delivery;
+
+        if(optDelivery.isPresent()){
+            delivery = optDelivery.get();
+        }
+        else{
+            delivery = null;
+        }
+
+        List<String> beingDeliveredStatusList = Arrays.asList(STATUS_BEING_DELIVERED.split(","));
+        List<String> deliveredToCustomer = Arrays.asList(STATUS_DELIVERED_TO_CUSTOMER.split(","));
+        if(beingDeliveredStatusList.contains(status)){
+            delivery.setStatus(Status.BEING_DELIVERED);
+        }
+
+        else if(deliveredToCustomer.contains(status)){
+            delivery.setStatus(Status.DELIVERED_TO_CUSTOMER);
+        }
+
+        return deliveryRepository.save(delivery);
+    }
+
+    public Status getPreviousStatus(String dpRefId){
+        String id = deliveryRepository.findByOrderId(dpRefId).toString();
+        Optional<Delivery> optionalDelivery = deliveryRepository.findById(id);
+        Delivery delivery;
+        if(optionalDelivery.isPresent()){
+            delivery = optionalDelivery.get();
+        }
+        else{
+            delivery = null;
+        }
+
+        return delivery.getStatus();
     }
 }
