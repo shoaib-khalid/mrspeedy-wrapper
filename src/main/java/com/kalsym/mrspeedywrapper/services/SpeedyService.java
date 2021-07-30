@@ -3,21 +3,17 @@ package com.kalsym.mrspeedywrapper.services;
 import com.google.gson.Gson;
 import com.kalsym.mrspeedywrapper.models.Person;
 import com.kalsym.mrspeedywrapper.models.Point;
-import com.kalsym.mrspeedywrapper.models.enums.DeliveryStatus;
 import com.kalsym.mrspeedywrapper.models.request.QuotationRequest;
 import com.kalsym.mrspeedywrapper.models.response.Response;
 import com.kalsym.mrspeedywrapper.repositories.DeliveryRepository;
 import com.kalsym.mrspeedywrapper.repositories.DropoffDetailsRepository;
 import com.kalsym.mrspeedywrapper.repositories.PickupDetailsRepository;
 import com.kalsym.mrspeedywrapper.repositories.TrackingInfoRepository;
-import com.kalsym.parentwrapper.models.Delivery;
-import com.kalsym.parentwrapper.models.DropoffDetails;
-import com.kalsym.parentwrapper.models.PickupDetails;
-import com.kalsym.parentwrapper.models.TrackingInfo;
+import com.kalsym.parentwrapper.models.*;
 import com.kalsym.parentwrapper.models.enums.Status;
 import com.kalsym.parentwrapper.models.mqtt.StatusMessage;
 import com.kalsym.parentwrapper.mqtt.MqttPublisher;
-import com.kalsym.parentwrapper.services.ParentService;
+import com.kalsym.parentwrapper.services.DeliveryService;
 import com.kalsym.parentwrapper.utils.LogUtil;
 import org.eclipse.paho.client.mqttv3.MqttException;
 import org.json.JSONObject;
@@ -26,9 +22,11 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.remoting.httpinvoker.HttpInvokerClientInterceptor;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
-
 import javax.servlet.http.HttpServletRequest;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,7 +34,7 @@ import java.util.List;
 import java.util.Optional;
 
 @Service
-public class SpeedyService extends ParentService {
+public class SpeedyService extends DeliveryService {
     @Autowired
     private DeliveryRepository deliveryRepository;
 
@@ -67,6 +65,15 @@ public class SpeedyService extends ParentService {
     @Value("${status.delivered_to_customer}")
     private String STATUS_DELIVERED_TO_CUSTOMER;
 
+    @Value("${mqtt.url}")
+    private String MQTT_URL;
+
+    @Value("${mqtt.clientId}")
+    private String MQTT_CLIENT_ID;
+
+    @Value("${mqtt.message.template}")
+    private String MQTT_MESSAGE_TEMPLATE;
+
 
     @Override
     public Delivery addQuotation(HttpServletRequest httpServletRequest, Delivery delivery) {
@@ -74,9 +81,12 @@ public class SpeedyService extends ParentService {
         String logprefix = httpServletRequest.getRequestURI() + " ";
         String location = Thread.currentThread().getStackTrace()[1].getMethodName();
 
+        LogUtil.info(logprefix, location, "ENTERED METHOD addQuotation", "");
+
+
         RestTemplate restTemplate = new RestTemplate();
         QuotationRequest orderDetails = new QuotationRequest();
-//        orderDetails.setMatter("documents");
+
         if(delivery.getVehicleType().ordinal() == 1){
             orderDetails.setVehicle_type_id(8);
         }
@@ -86,6 +96,7 @@ public class SpeedyService extends ParentService {
         orderDetails.setTotal_weight_kg(delivery.getWeight());
 
         ArrayList<Point> points = new ArrayList<>();
+
         Point p1 = new Point();
         p1.setAddress(delivery.getPickupDetails().getAddress());
         p1.setContact_person(new Person(delivery.getPickupDetails().getContactPhone(), delivery.getDropoffDetails().getContactName()));
@@ -98,25 +109,23 @@ public class SpeedyService extends ParentService {
         orderDetails.setPoints(points);
         JSONObject requestBody = new JSONObject(orderDetails);
 
-//        LogUtil.info();
         HttpHeaders headers = new HttpHeaders();
         headers.add("X-DV-Auth-Token", MR_SPEEDY_KEY);
-        HttpEntity<String> req =new HttpEntity<>(requestBody.toString(), headers);
+        HttpEntity<String> request =new HttpEntity<>(requestBody.toString(), headers);
 
-        LogUtil.info(logprefix, location, "MrSpeedy Request body: ", new JSONObject(req.getBody()).toString());
+        LogUtil.info(logprefix, location, "METHOD POST, URL : ",BASE_URL+ENDPOINT_QUOTATION);
 
-//        System.out.println(requestBody.toString());
-        JSONObject responseJson = new JSONObject(restTemplate.exchange(BASE_URL+ENDPOINT_QUOTATION, HttpMethod.POST, req, String.class).getBody());
-        Response response = new Gson().fromJson(responseJson.toString(), Response.class);
+        LogUtil.info(logprefix, location, "REQUEST BODY FOR "+BASE_URL+ENDPOINT_QUOTATION, new JSONObject(request.getBody()).toString());
 
-        LogUtil.info(logprefix, location, "MrSpeedy Response body: ", new JSONObject(response).toString());
+        Response response= restTemplate.exchange(BASE_URL+ENDPOINT_QUOTATION, HttpMethod.POST, request, Response.class).getBody();
 
+//        JSONObject responseJson = new JSONObject();
+//        Response response = new Gson().fromJson(responseJson.toString(), Response.class);
+
+        LogUtil.info(logprefix, location, "RESPONSE FROM : "+BASE_URL+ENDPOINT_QUOTATION, new JSONObject(response).toString());
 
         delivery.setCharges(Double.parseDouble(response.getOrder().getDelivery_fee_amount()));
         delivery.setStatus(Status.QUOTED);
-
-//        System.out.println(new JSONObject(response).toString());
-
 
         PickupDetails pickupDetails = delivery.getPickupDetails();
         DropoffDetails dropoffDetails = delivery.getDropoffDetails();
@@ -128,25 +137,36 @@ public class SpeedyService extends ParentService {
         dropoffDetails.setLatitude(Double.parseDouble(response.getOrder().getPoints().get(1).getLatitude()));
         dropoffDetails.setLongitude(Double.parseDouble(response.getOrder().getPoints().get(1).getLongitude()));
 
-
-
+        //to avoid foreign key conflict on first time save
         delivery.setObjectsNull();
 
-        delivery = deliveryRepository.save(delivery);
+        try{
+            delivery = deliveryRepository.save(delivery);
 
-        pickupDetails.setDeliveryId(delivery.getId());
-        dropoffDetails.setDeliveryId(delivery.getId());
-        trackingInfo.setDeliveryId(delivery.getId());
+            pickupDetails.setDeliveryId(delivery.getId());
+            dropoffDetails.setDeliveryId(delivery.getId());
+            trackingInfo.setDeliveryId(delivery.getId());
 
-        pickupDetailsRepository.save(pickupDetails);
-        dropoffDetailsRepository.save(dropoffDetails);
-        trackingInfoRepository.save(trackingInfo);
+            pickupDetailsRepository.save(pickupDetails);
+            dropoffDetailsRepository.save(dropoffDetails);
+            trackingInfoRepository.save(trackingInfo);
 
-        delivery.setDropoffDetails(dropoffDetails);
-        delivery.setPickupDetails(pickupDetails);
-        delivery.setTrackingInfo(trackingInfo);
+            delivery.setDropoffDetails(dropoffDetails);
+            delivery.setPickupDetails(pickupDetails);
+            delivery.setTrackingInfo(trackingInfo);
 
-        return delivery;
+            LogUtil.info(logprefix, location, "DELIVERY QUOTATION DETAILS : ", new JSONObject(delivery).toString());
+
+            LogUtil.info(logprefix, location, "EXITING METHOD addQuotation","");
+
+
+        }catch (Exception e)
+        {
+            LogUtil.error(logprefix,location, "ERROR SAVING DELIVERY TO DATABASE", "", e);
+            delivery = null;
+        }finally {
+            return delivery;
+        }
     }
 
     @Override
@@ -155,10 +175,7 @@ public class SpeedyService extends ParentService {
         String logprefix = servletRequest.getRequestURI() + " ";
         String location = Thread.currentThread().getStackTrace()[1].getMethodName();
 
-
-
-//        String dpRefId = "12316892173";
-//        String trackingNo = "8934262374";
+        LogUtil.info(logprefix, location, "ENTERED METHOD placeDeliveryOrder", "");
 
         Optional<Delivery> optDelivery = deliveryRepository.findById(quotationId);
 
@@ -172,6 +189,11 @@ public class SpeedyService extends ParentService {
             return null;
         }
         TrackingInfo trackingInfo = optTrackingInfo.get();
+
+        if(delivery.getStatus().equals(Status.BEING_DELIVERED)){
+            LogUtil.warn(logprefix, location, "ORDER ALREADY PLACED", "");
+            throw new HttpClientErrorException(HttpStatus.CONFLICT, "ORDER ALREADY PLACED !");
+        }
 
         QuotationRequest request = new QuotationRequest();
         request.setMatter("documents");
@@ -194,39 +216,47 @@ public class SpeedyService extends ParentService {
         headers.add("X-DV-Auth-Token", MR_SPEEDY_KEY);
         HttpEntity<QuotationRequest> req =new HttpEntity<>(request, headers);
 
-        LogUtil.info(logprefix, location, "MrSpeedy Request body: ", new JSONObject(req.getBody()).toString());
+        LogUtil.info(logprefix, location, "METHOD POST, URL : ",BASE_URL+ENDPOINT_PLACE_ORDER);
+
+        LogUtil.info(logprefix, location, "REQUEST BODY FOR "+BASE_URL+ENDPOINT_PLACE_ORDER, new JSONObject(req.getBody()).toString());
+
+//        LogUtil.info(logprefix, location, "MrSpeedy Request body: ", new JSONObject(req.getBody()).toString());
 
 
-        JSONObject responseJson = new JSONObject(restTemplate.exchange(BASE_URL+ENDPOINT_PLACE_ORDER, HttpMethod.POST, req, String.class).getBody());
-        Response response = new Gson().fromJson(responseJson.toString(), Response.class);
+        Response response = restTemplate.exchange(BASE_URL+ENDPOINT_PLACE_ORDER, HttpMethod.POST, req, Response.class).getBody();
 
-        LogUtil.info(logprefix, location, "MrSpeedy Response body: ", new JSONObject(response).toString());
-
+        LogUtil.info(logprefix, location, "RESPONSE FROM : "+BASE_URL+ENDPOINT_PLACE_ORDER, new JSONObject(response).toString());
 
         trackingInfo.setTrackingNo(response.getOrder().getPoints().get(0).getTracking_url());
-
-        System.out.println(new JSONObject(response).toString());
 
         delivery.setDpRefId(response.getOrder().getOrder_id());
 
         delivery.setStatus(Status.BEING_DELIVERED);
 
-        trackingInfoRepository.save(trackingInfo);
-        Delivery placedDeliveryOrder = deliveryRepository.save(delivery);
+        Delivery placedDeliveryOrder;
+
+        try{
+            trackingInfoRepository.save(trackingInfo);
+            placedDeliveryOrder = deliveryRepository.save(delivery);
+        }catch (Exception e){
+            LogUtil.error(logprefix, location, "ERROR SAVING DELIVERY TO DATABASE", "", e);
+            placedDeliveryOrder = null;
+            throw new HttpClientErrorException(HttpStatus.resolve(503),"Error Saving to Database");
+        }
 
         try {
-            MqttPublisher publisher = new MqttPublisher("192.168.0.201:30408","publisher");
+            MqttPublisher publisher = new MqttPublisher(MQTT_URL,MQTT_CLIENT_ID);
             StatusMessage statusMessage = new StatusMessage(Status.BEING_DELIVERED);
             JSONObject message = new JSONObject(statusMessage);
+            String topic = MQTT_MESSAGE_TEMPLATE.replace("_", delivery.getSfRefId());
+            publisher.sendMessage(message, topic);
 
+            //"orders/"+delivery.getSfRefId()+"/status-update"
 
-            publisher.sendMessage(message, "orders/"+delivery.getSfRefId()+"/status-update");
-
-            LogUtil.info(logprefix, location, "Mqtt Message: ", "orders/"+delivery.getSfRefId()+"/status-update");
+            LogUtil.info(logprefix, location, "Mqtt Topic : "+topic+" Mqtt Message : "+message,"" );
 
         } catch (MqttException e) {
-            System.out.println("Error Creating publisher");
-            e.printStackTrace();
+            LogUtil.error(logprefix, location, "MQTT PUBLISHER COULD NOT CONNECT TO BROKER", " ",e);
         }
 
         return placedDeliveryOrder;
@@ -272,5 +302,23 @@ public class SpeedyService extends ParentService {
         }
 
         return delivery.getStatus();
+    }
+
+    public void publishStatus(Delivery delivery, String logprefix){
+
+        String location = Thread.currentThread().getStackTrace()[1].getMethodName();
+        StatusMessage statusMessage = new StatusMessage(delivery.getStatus());
+        JSONObject message = new JSONObject(statusMessage);
+        String topic = MQTT_MESSAGE_TEMPLATE.replace("_", delivery.getSfRefId());
+
+        try {
+            MqttPublisher publisher = new MqttPublisher(MQTT_URL,MQTT_CLIENT_ID);
+            publisher.sendMessage(message, topic);
+            publisher.getPublisher().close();
+        } catch (MqttException e) {
+            LogUtil.error(logprefix, location, "MQTT PUBLISHER COULD NOT CONNECT TO BROKER", " ",e);
+        }finally {
+            LogUtil.info(logprefix, location, "Mqtt Topic : "+topic+" Mqtt Message : "+message, "");
+        }
     }
 }
